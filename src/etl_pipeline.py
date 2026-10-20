@@ -12,10 +12,17 @@ The script scans the full file, so the run can take a few minutes.
 """
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
+import time
 
 import duckdb
+
+
+# INFO is normal progress. WARNING means some rows failed validation
+# but were still written to the rejected file. ERROR means the run stopped.
+logger = logging.getLogger(__name__)
 
 
 # __file__ is this script. parent is src/, and parent.parent is the project folder.
@@ -69,6 +76,19 @@ class PipelineCounts:
     valid_rows: int
     rejected_rows: int
     missing_either_latency_direction: int
+
+
+def configure_logging() -> None:
+    """Show log messages on the console when this file is run directly.
+
+    Tests can capture the same messages without this setup. basicConfig
+    does nothing if logging was already configured.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def ensure_raw_dataset_exists(path: Path) -> None:
@@ -285,6 +305,7 @@ def run_pipeline(
     Called with no arguments, this uses the real files in data/raw and
     data/processed. Tests pass temporary paths so the real files stay put.
     """
+    started = time.perf_counter()
     source = RAW_DATASET_PATH if source_path is None else Path(source_path)
     valid_output = VALID_OUTPUT_PATH if valid_output_path is None else Path(valid_output_path)
     rejected_output = (
@@ -292,31 +313,62 @@ def run_pipeline(
         if rejected_output_path is None
         else Path(rejected_output_path)
     )
-    ensure_raw_dataset_exists(source)
-    raw_signature = (source.stat().st_size, source.stat().st_mtime_ns)
-    print(f"Raw input: {source}", flush=True)
-    print("Counting rows with a read-only DuckDB query.", flush=True)
-
-    connection = duckdb.connect(database=":memory:")
+    logger.info("Pipeline started.")
+    logger.info("Input file: %s", source)
+    logger.info("Valid output file: %s", valid_output)
+    logger.info("Rejected output file: %s", rejected_output)
     try:
-        counts = collect_counts(connection, source)
-        build_outputs(connection, counts, source, valid_output, rejected_output)
-    except duckdb.Error as error:
-        raise RuntimeError(
-            "DuckDB could not finish the pipeline for:\n"
-            f"  {source}\n"
-            f"Reason: {error}"
-        ) from error
-    finally:
-        connection.close()
+        ensure_raw_dataset_exists(source)
+        raw_signature = (source.stat().st_size, source.stat().st_mtime_ns)
+        print(f"Raw input: {source}", flush=True)
+        print("Counting rows with a read-only DuckDB query.", flush=True)
 
-    current_signature = (source.stat().st_size, source.stat().st_mtime_ns)
-    if current_signature != raw_signature:
-        raise RuntimeError(
-            "The input file changed during the pipeline.\n"
-            f"  {source}"
+        connection = duckdb.connect(database=":memory:")
+        try:
+            counts = collect_counts(connection, source)
+            logger.info("Rows read: %s", f"{counts.input_rows:,}")
+            build_outputs(connection, counts, source, valid_output, rejected_output)
+        except duckdb.Error as error:
+            raise RuntimeError(
+                "DuckDB could not finish the pipeline for:\n"
+                f"  {source}\n"
+                f"Reason: {error}"
+            ) from error
+        finally:
+            connection.close()
+
+        current_signature = (source.stat().st_size, source.stat().st_mtime_ns)
+        if current_signature != raw_signature:
+            raise RuntimeError(
+                "The input file changed during the pipeline.\n"
+                f"  {source}"
+            )
+
+        logger.info(
+            "Valid rows written: %s. Output file: %s",
+            f"{counts.valid_rows:,}",
+            valid_output,
         )
-    return counts
+        if counts.rejected_rows > 0:
+            logger.warning(
+                "Validation rejected %s row(s). Those rows were written to %s.",
+                f"{counts.rejected_rows:,}",
+                rejected_output,
+            )
+        else:
+            logger.info("Rejected rows: 0.")
+        elapsed_seconds = time.perf_counter() - started
+        logger.info("Pipeline finished in %.3f seconds.", elapsed_seconds)
+        return counts
+    except Exception as error:
+        elapsed_seconds = time.perf_counter() - started
+        logger.exception(
+            "Pipeline failed after %.3f seconds. Input file: %s. %s",
+            elapsed_seconds,
+            source,
+            error,
+        )
+        raise
 
 
 def print_report(counts: PipelineCounts) -> None:
@@ -360,8 +412,8 @@ def print_report(counts: PipelineCounts) -> None:
 
 def main() -> None:
     """Run the pipeline and print a message when a read or write fails."""
+    configure_logging()
     try:
-        ensure_raw_dataset_exists(RAW_DATASET_PATH)
         counts = run_pipeline()
     except (FileNotFoundError, RuntimeError, OSError) as error:
         print()

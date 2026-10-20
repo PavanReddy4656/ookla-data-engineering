@@ -4,6 +4,7 @@ These tests do not read the production Parquet data. A fixture records the
 size and modified time of the real data files and checks that they stay the same.
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -220,6 +221,7 @@ def test_validation_keeps_good_rows_and_rejects_bad_rows(
 
 def test_all_valid_rows_do_not_write_a_rejected_file(
     tmp_path: Path,
+    caplog: pytest.CaptureFixture[str],
     protect_project_data: None,
 ) -> None:
     """A clean input removes an older rejected file instead of leaving it behind."""
@@ -232,6 +234,7 @@ def test_all_valid_rows_do_not_write_a_rejected_file(
         [make_row("valid-with-null-latency", avg_lat_down_ms=None, avg_lat_up_ms=None)],
     )
 
+    caplog.set_level(logging.INFO, logger="etl_pipeline")
     counts = etl_pipeline.run_pipeline(
         source_path=source,
         valid_output_path=valid_output,
@@ -247,11 +250,73 @@ def test_all_valid_rows_do_not_write_a_rejected_file(
     written = read_sample(valid_output)
     assert written[0]["avg_lat_down_ms"] is None
     assert written[0]["avg_lat_up_ms"] is None
+    pipeline_logs = [record for record in caplog.records if record.name == "etl_pipeline"]
+    assert any(record.getMessage() == "Rejected rows: 0." for record in pipeline_logs)
+    assert not any(record.levelno == logging.WARNING for record in pipeline_logs)
+
+
+def test_logs_counts_duration_and_rejected_rows(
+    tmp_path: Path,
+    caplog: pytest.CaptureFixture[str],
+    protect_project_data: None,
+) -> None:
+    """A mixed file logs progress at INFO and the rejected rows at WARNING."""
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    write_sample(
+        source,
+        [
+            make_row("kept", avg_lat_down_ms=None),
+            make_row("negative-download", avg_d_kbps=-5),
+        ],
+    )
+
+    caplog.set_level(logging.INFO, logger="etl_pipeline")
+    counts = etl_pipeline.run_pipeline(
+        source_path=source,
+        valid_output_path=valid_output,
+        rejected_output_path=rejected_output,
+    )
+
+    assert counts.input_rows == 2
+    assert counts.valid_rows == 1
+    assert counts.rejected_rows == 1
+    messages = {
+        record.levelno: record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline"
+    }
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline" and record.levelno == logging.INFO
+    ]
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline" and record.levelno == logging.WARNING
+    ]
+    assert "Pipeline started." in info_messages
+    assert f"Input file: {source}" in info_messages
+    assert f"Valid output file: {valid_output}" in info_messages
+    assert f"Rejected output file: {rejected_output}" in info_messages
+    assert "Rows read: 2" in info_messages
+    assert f"Valid rows written: 1. Output file: {valid_output}" in info_messages
+    assert any(message.startswith("Pipeline finished in ") for message in info_messages)
+    assert warning_messages == [
+        f"Validation rejected 1 row(s). Those rows were written to {rejected_output}."
+    ]
+    assert logging.ERROR not in messages
+    kept = read_sample(valid_output)
+    assert kept[0]["quadkey"] == "kept"
+    assert kept[0]["avg_lat_down_ms"] is None
 
 
 def test_missing_input_file_reports_an_error(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
     protect_project_data: None,
 ) -> None:
@@ -259,6 +324,7 @@ def test_missing_input_file_reports_an_error(
     missing = tmp_path / "missing.parquet"
     valid_output = tmp_path / "valid.parquet"
     rejected_output = tmp_path / "rejected.parquet"
+    caplog.set_level(logging.INFO, logger="etl_pipeline")
 
     with pytest.raises(FileNotFoundError, match="raw dataset is missing"):
         etl_pipeline.run_pipeline(
@@ -280,3 +346,55 @@ def test_missing_input_file_reports_an_error(
     assert "raw dataset is missing" in output
     assert str(missing) in output
     assert "Pipeline finished." not in output
+    error_logs = [
+        record
+        for record in caplog.records
+        if record.name == "etl_pipeline" and record.levelno == logging.ERROR
+    ]
+    assert error_logs
+    assert all(record.exc_info is not None for record in error_logs)
+    assert any(str(missing) in record.getMessage() for record in error_logs)
+    assert not any(
+        "Pipeline finished in " in record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline"
+    )
+
+
+def test_unreadable_input_logs_the_database_error(
+    tmp_path: Path,
+    caplog: pytest.CaptureFixture[str],
+    protect_project_data: None,
+) -> None:
+    """A file DuckDB cannot read is logged as an error and leaves no output."""
+    source = tmp_path / "bad.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    source.write_text("this is not a parquet file", encoding="utf-8")
+
+    caplog.set_level(logging.INFO, logger="etl_pipeline")
+    with pytest.raises(RuntimeError, match="DuckDB could not finish"):
+        etl_pipeline.run_pipeline(
+            source_path=source,
+            valid_output_path=valid_output,
+            rejected_output_path=rejected_output,
+        )
+
+    assert not valid_output.exists()
+    assert not rejected_output.exists()
+    error_logs = [
+        record
+        for record in caplog.records
+        if record.name == "etl_pipeline" and record.levelno == logging.ERROR
+    ]
+    assert len(error_logs) == 1
+    message = error_logs[0].getMessage()
+    assert "Pipeline failed after " in message
+    assert str(source) in message
+    assert "DuckDB could not finish" in message
+    assert error_logs[0].exc_info is not None
+    assert not any(
+        record.levelno == logging.INFO and "Pipeline finished in " in record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline"
+    )
