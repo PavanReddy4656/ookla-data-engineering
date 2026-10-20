@@ -1,8 +1,8 @@
 # Network Performance Data Engineering Pipeline
 
-A beginner portfolio project that will turn public network performance data into clean, queryable tables on your own computer.
+A beginner portfolio project that turns public Ookla fixed-broadband measurements into a clean local table.
 
-Nothing is installed yet, no dataset has been downloaded, and no cloud resources have been created. This repository currently holds the folder layout and the plan for the work ahead.
+The pipeline reads the raw Parquet file, checks each row, and writes the valid rows to `data/processed`. It does not change the raw file.
 
 ## Objective
 
@@ -14,7 +14,7 @@ Build a small, local data engineering pipeline that:
 4. Saves analysis-ready outputs.
 5. Checks the important steps with automated tests.
 
-The exact columns will be written down only after we inspect a real data file. This README does not guess the schema.
+The processed file keeps the columns from the raw file. A missing downstream or upstream latency value is allowed and does not remove the row.
 
 ## Planned local stack
 
@@ -56,22 +56,61 @@ Empty folders contain a `.gitkeep` file so Git can track the folder even when it
 
 ## Windows and PowerShell
 
-Commands in this project use PowerShell. When it is time to install packages, the commands will look like this:
+Commands in this project use PowerShell. From the project folder:
 
 ```powershell
-python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe src\etl_pipeline.py
+.\.venv\Scripts\python.exe -m pytest tests
 ```
 
-Do not run those commands yet. Packages stay uninstalled until a later step.
+If PowerShell blocks the activate script, that is the execution policy, not a broken project.
 
-If PowerShell blocks the activate script, that is the execution policy, not a broken project. We will handle it when we create the virtual environment.
+## Data-quality summary
 
-## What this step does not include
+A successful pipeline run logs this summary and prints the same text at the end. The numbers below are an example from a tiny file, not a copy of the full dataset. A real run prints the full Windows path of the output file:
 
-- No `pip install`
-- No dataset download
-- No AWS resources
-- No pipeline code
-- No invented column list
+```text
+Data-quality summary
+---------------------
+Input rows: 4
+Valid rows: 3
+Rejected rows: 1
+Rejection percentage: 25.00%
+Null avg_lat_down_ms: 2
+Null avg_lat_up_ms: 1
+Valid output file: data/processed/2024-10-01_performance_fixed_tiles.parquet
+Duration: 1.250 seconds
+```
+
+| Metric | Meaning |
+| --- | --- |
+| Input rows | Rows read from the raw Parquet file. |
+| Valid rows | Rows that passed every validation rule and were written to the processed file. |
+| Rejected rows | Rows that failed a rule. They are written to `rejected_records.parquet` when this count is above zero. |
+| Rejection percentage | Rejected rows divided by input rows, shown as a percent. An empty input has no rejected rows, so this is `0.00%`. |
+| Null avg_lat_down_ms | Input rows missing downstream latency. These rows are kept when the other rules pass. |
+| Null avg_lat_up_ms | Input rows missing upstream latency. These rows are kept when the other rules pass. |
+| Valid output file | Path of the processed Parquet file written by this run. |
+| Duration | Seconds from the start of the run until the outputs are in place. |
+
+High download speed, upload speed, or latency does not reject a row. The pipeline does not invent a cutoff for outliers.
+
+## SQL analytics
+
+The `sql` folder holds reusable read-only queries. Each row in the processed file is one geographic tile. `avg_d_kbps` and `avg_u_kbps` are already averages for that tile, stored in kilobits per second. `tests` and `devices` are counts stored on the tile, not individual speed tests or unique users.
+
+Run the queries from the project folder:
+
+```powershell
+.\.venv\Scripts\python.exe src\run_sql_analytics.py
+```
+
+The script opens `data/processed/2024-10-01_performance_fixed_tiles.parquet` in DuckDB and runs the SQL files. It does not change the raw or processed files.
+
+| SQL file | Purpose |
+| --- | --- |
+| `sql/speed_summary.sql` | Average and median download and upload speed across tiles. Speeds are shown in Mbps, using 1 Mbps = 1,000 kbps. |
+| `sql/speed_by_test_count_tercile.sql` | Average download speed and latency for three groups created with `NTILE(3)`. Group 1 has the lowest tile test counts and group 3 has the highest. These groups are not official Ookla categories. |
+| `sql/top_tiles_by_download_speed.sql` | The 100 tiles with the highest tile-level download speed, with each tile's test count and latency. Equal speeds are ordered by test count, then by quadkey. |
+| `sql/data_quality_checks.sql` | Counts of missing downstream and upstream latency, plus tiles that fail the core validation rules. Missing directional latency is reported and does not by itself make a tile invalid. The query does not delete rows. |

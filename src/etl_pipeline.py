@@ -75,7 +75,26 @@ class PipelineCounts:
     input_rows: int
     valid_rows: int
     rejected_rows: int
+    null_avg_lat_down_ms: int
+    null_avg_lat_up_ms: int
     missing_either_latency_direction: int
+    elapsed_seconds: float = 0.0
+    valid_output_path: Path | None = None
+
+    @property
+    def rejection_percentage(self) -> float:
+        """Percent of input rows that failed validation.
+
+        An empty file has no rejected rows, so the percentage is 0.
+        """
+        return calculate_rejection_percentage(self.rejected_rows, self.input_rows)
+
+
+def calculate_rejection_percentage(rejected_rows: int, input_rows: int) -> float:
+    """Calculate rejected rows as a percent of input rows."""
+    if input_rows == 0:
+        return 0.0
+    return (rejected_rows / input_rows) * 100
 
 
 def configure_logging() -> None:
@@ -160,20 +179,27 @@ def collect_counts(
             count(*) AS input_rows,
             count(*) FILTER (WHERE {VALID_RECORD_CONDITION}) AS valid_rows,
             count(*) FILTER (WHERE NOT {VALID_RECORD_CONDITION}) AS rejected_rows,
+            count(*) FILTER (WHERE avg_lat_down_ms IS NULL) AS null_avg_lat_down_ms,
+            count(*) FILTER (WHERE avg_lat_up_ms IS NULL) AS null_avg_lat_up_ms,
             count(*) FILTER (
                 WHERE avg_lat_down_ms IS NULL OR avg_lat_up_ms IS NULL
             ) AS missing_either_latency_direction
         FROM read_parquet(?)
     """
-    row = connection.execute(count_sql, [str(source)]).fetchone()
+    result = connection.execute(count_sql, [str(source)])
+    headers = [item[0] for item in result.description]
+    row = result.fetchone()
     if row is None:
         raise RuntimeError("The count query finished without returning a row.")
+    values = dict(zip(headers, row))
 
     counts = PipelineCounts(
-        input_rows=as_int(row[0]),
-        valid_rows=as_int(row[1]),
-        rejected_rows=as_int(row[2]),
-        missing_either_latency_direction=as_int(row[3]),
+        input_rows=as_int(values["input_rows"]),
+        valid_rows=as_int(values["valid_rows"]),
+        rejected_rows=as_int(values["rejected_rows"]),
+        null_avg_lat_down_ms=as_int(values["null_avg_lat_down_ms"]),
+        null_avg_lat_up_ms=as_int(values["null_avg_lat_up_ms"]),
+        missing_either_latency_direction=as_int(values["missing_either_latency_direction"]),
     )
     accounted_rows = counts.valid_rows + counts.rejected_rows
     if accounted_rows != counts.input_rows:
@@ -245,6 +271,28 @@ def remove_stale_rejected_file(
     assert_safe_output(rejected_output_path, allowed_dir, source_path)
     if rejected_output_path.exists():
         rejected_output_path.unlink()
+
+
+def format_quality_summary(counts: PipelineCounts) -> str:
+    """Build the end-of-run data-quality summary.
+
+    Nulls in the two latency-direction columns are reported here.
+    Those nulls do not make a row invalid.
+    """
+    output_path = counts.valid_output_path or "not available"
+    lines = [
+        "Data-quality summary",
+        "---------------------",
+        f"Input rows: {counts.input_rows:,}",
+        f"Valid rows: {counts.valid_rows:,}",
+        f"Rejected rows: {counts.rejected_rows:,}",
+        f"Rejection percentage: {counts.rejection_percentage:.2f}%",
+        f"Null avg_lat_down_ms: {counts.null_avg_lat_down_ms:,}",
+        f"Null avg_lat_up_ms: {counts.null_avg_lat_up_ms:,}",
+        f"Valid output file: {output_path}",
+        f"Duration: {counts.elapsed_seconds:.3f} seconds",
+    ]
+    return "\n".join(lines)
 
 
 def file_size_text(path: Path) -> str:
@@ -357,8 +405,10 @@ def run_pipeline(
             )
         else:
             logger.info("Rejected rows: 0.")
-        elapsed_seconds = time.perf_counter() - started
-        logger.info("Pipeline finished in %.3f seconds.", elapsed_seconds)
+        counts.elapsed_seconds = time.perf_counter() - started
+        counts.valid_output_path = valid_output
+        logger.info("%s", format_quality_summary(counts))
+        logger.info("Pipeline finished in %.3f seconds.", counts.elapsed_seconds)
         return counts
     except Exception as error:
         elapsed_seconds = time.perf_counter() - started
@@ -406,6 +456,8 @@ def print_report(counts: PipelineCounts) -> None:
         print("Rejected records: no file was needed.")
         print("  No records failed validation, so rejected_records.parquet was not written.")
 
+    print()
+    print(format_quality_summary(counts))
     print()
     print("Pipeline finished. The raw dataset was only read.")
 

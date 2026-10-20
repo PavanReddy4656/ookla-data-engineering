@@ -89,10 +89,11 @@ def write_sample(path: Path, rows: list[dict[str, object]]) -> None:
             )
             """
         )
-        connection.executemany(
-            "INSERT INTO sample VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [tuple(row[column] for column in COLUMNS) for row in rows],
-        )
+        if rows:
+            connection.executemany(
+                "INSERT INTO sample VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [tuple(row[column] for column in COLUMNS) for row in rows],
+            )
         destination = path.resolve().as_posix().replace("'", "''")
         connection.execute(f"COPY sample TO '{destination}' (FORMAT PARQUET)")
     finally:
@@ -244,6 +245,9 @@ def test_all_valid_rows_do_not_write_a_rejected_file(
     assert counts.input_rows == 1
     assert counts.valid_rows == 1
     assert counts.rejected_rows == 0
+    assert counts.rejection_percentage == 0.0
+    assert counts.null_avg_lat_down_ms == 1
+    assert counts.null_avg_lat_up_ms == 1
     assert counts.missing_either_latency_direction == 1
     assert valid_output.is_file()
     assert not rejected_output.exists()
@@ -307,6 +311,23 @@ def test_logs_counts_duration_and_rejected_rows(
     assert warning_messages == [
         f"Validation rejected 1 row(s). Those rows were written to {rejected_output}."
     ]
+    assert counts.rejection_percentage == 50.0
+    assert counts.null_avg_lat_down_ms == 1
+    assert counts.null_avg_lat_up_ms == 0
+    summary = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline"
+        and record.getMessage().startswith("Data-quality summary")
+    )
+    assert "Input rows: 2" in summary
+    assert "Valid rows: 1" in summary
+    assert "Rejected rows: 1" in summary
+    assert "Rejection percentage: 50.00%" in summary
+    assert "Null avg_lat_down_ms: 1" in summary
+    assert "Null avg_lat_up_ms: 0" in summary
+    assert f"Valid output file: {valid_output}" in summary
+    assert "Duration:" in summary
     assert logging.ERROR not in messages
     kept = read_sample(valid_output)
     assert kept[0]["quadkey"] == "kept"
@@ -398,3 +419,102 @@ def test_unreadable_input_logs_the_database_error(
         for record in caplog.records
         if record.name == "etl_pipeline"
     )
+
+
+def test_rejection_percentage_is_zero_for_an_empty_input() -> None:
+    """No input rows means there are no rejected rows to turn into a percentage."""
+    assert etl_pipeline.calculate_rejection_percentage(0, 0) == 0.0
+    assert etl_pipeline.calculate_rejection_percentage(0, 4) == 0.0
+    assert etl_pipeline.calculate_rejection_percentage(1, 4) == 25.0
+
+
+def test_missing_directional_latency_is_counted_and_kept(
+    tmp_path: Path,
+    caplog: pytest.CaptureFixture[str],
+    protect_project_data: None,
+) -> None:
+    """Null downstream or upstream latency stays in the valid output."""
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    write_sample(
+        source,
+        [
+            make_row("both-present"),
+            make_row("down-null", avg_lat_down_ms=None),
+            make_row("up-null", avg_lat_up_ms=None),
+            make_row("both-null", avg_lat_down_ms=None, avg_lat_up_ms=None),
+        ],
+    )
+
+    caplog.set_level(logging.INFO, logger="etl_pipeline")
+    counts = etl_pipeline.run_pipeline(
+        source_path=source,
+        valid_output_path=valid_output,
+        rejected_output_path=rejected_output,
+    )
+
+    assert counts.input_rows == 4
+    assert counts.valid_rows == 4
+    assert counts.rejected_rows == 0
+    assert counts.rejection_percentage == 0.0
+    assert counts.null_avg_lat_down_ms == 2
+    assert counts.null_avg_lat_up_ms == 2
+    assert counts.missing_either_latency_direction == 3
+    written = {row["quadkey"]: row for row in read_sample(valid_output)}
+    assert written["down-null"]["avg_lat_down_ms"] is None
+    assert written["down-null"]["avg_lat_up_ms"] == 15
+    assert written["up-null"]["avg_lat_up_ms"] is None
+    assert written["both-null"]["avg_lat_down_ms"] is None
+    assert written["both-null"]["avg_lat_up_ms"] is None
+    summary = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline"
+        and record.getMessage().startswith("Data-quality summary")
+    )
+    assert "Null avg_lat_down_ms: 2" in summary
+    assert "Null avg_lat_up_ms: 2" in summary
+    assert "Rejection percentage: 0.00%" in summary
+
+
+def test_zero_row_input_reports_a_zero_rejection_percentage(
+    tmp_path: Path,
+    caplog: pytest.CaptureFixture[str],
+    protect_project_data: None,
+) -> None:
+    """An empty Parquet file still completes and writes an empty valid file."""
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    rejected_output.write_text("stale rejected file", encoding="utf-8")
+    write_sample(source, [])
+
+    caplog.set_level(logging.INFO, logger="etl_pipeline")
+    counts = etl_pipeline.run_pipeline(
+        source_path=source,
+        valid_output_path=valid_output,
+        rejected_output_path=rejected_output,
+    )
+
+    assert counts.input_rows == 0
+    assert counts.valid_rows == 0
+    assert counts.rejected_rows == 0
+    assert counts.rejection_percentage == 0.0
+    assert counts.null_avg_lat_down_ms == 0
+    assert counts.null_avg_lat_up_ms == 0
+    assert valid_output.is_file()
+    assert read_sample(valid_output) == []
+    assert not rejected_output.exists()
+    summary = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "etl_pipeline"
+        and record.getMessage().startswith("Data-quality summary")
+    )
+    assert "Input rows: 0" in summary
+    assert "Rejection percentage: 0.00%" in summary
+    assert f"Valid output file: {valid_output}" in summary
+    assert summary.index("Duration:") < len(summary)
+    pipeline_logs = [record for record in caplog.records if record.name == "etl_pipeline"]
+    assert not any(record.levelno == logging.WARNING for record in pipeline_logs)
