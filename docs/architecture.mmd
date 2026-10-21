@@ -1,0 +1,52 @@
+%%{init: {"flowchart": {"curve": "basis", "htmlLabels": true, "padding": 20, "nodeSpacing": 36, "rankSpacing": 48}, "theme": "base", "themeVariables": {"fontFamily": "Segoe UI, Arial, sans-serif", "fontSize": "16px", "lineColor": "#334155", "textColor": "#111827"}}}%%
+flowchart TB
+    dataset["Ookla fixed broadband Parquet dataset"]
+
+    subgraph compose["Docker Compose local runtime"]
+        direction TB
+        subgraph infra["Airflow infrastructure"]
+            direction LR
+            postgres[("PostgreSQL: Airflow metadata")]
+            redis[("Redis: Celery broker")]
+        end
+        subgraph orchestration["Apache Airflow orchestration"]
+            direction LR
+            checkTask["check_raw_parquet"]
+            etlTask["run_etl\nsrc/etl_pipeline.py"]
+            sqlTask["run_sql_analytics\nsrc/run_sql_analytics.py"]
+            checkTask -->|"raw file is present"| etlTask
+            etlTask -->|"ETL task succeeds"| sqlTask
+        end
+        infra -.->|"metadata and task queue"| orchestration
+    end
+
+    subgraph processing["Data processing"]
+        direction LR
+        rawData["Raw data"]
+        reader["PyArrow batch reader\n100,000-row batches"]
+        rules["DuckDB data validation"]
+        validRows["Valid records"]
+        rejectedRows["Rejected records"]
+        processed["Processed Parquet output"]
+        analytics["DuckDB SQL analytics"]
+        results["Summary and analytical results"]
+        rawData --> reader --> rules
+        rules -->|"passes the rules"| validRows
+        rules -->|"fails a rule"| rejectedRows
+        validRows --> processed --> analytics --> results
+    end
+
+    dataset -->|"Q4 2024 fixed tiles"| rawData
+    checkTask -.-> rawData
+    etlTask -.-> reader
+    sqlTask -.-> analytics
+
+    classDef source fill:#F3F4F6,stroke:#374151,color:#111827,stroke-width:1.5px;
+    classDef data fill:#E8F6F3,stroke:#0F6E56,color:#111827,stroke-width:1.5px;
+    classDef task fill:#E7F0FA,stroke:#1F4E79,color:#111827,stroke-width:1.5px;
+    classDef infra fill:#F8F4EA,stroke:#8A6D3B,color:#111827,stroke-width:1.5px;
+
+    class dataset source;
+    class rawData,reader,rules,validRows,rejectedRows,processed,analytics,results data;
+    class checkTask,etlTask,sqlTask task;
+    class postgres,redis infra;
