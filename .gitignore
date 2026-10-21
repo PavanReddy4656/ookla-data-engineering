@@ -35,6 +35,12 @@ data/processed/*
 *.duckdb
 *.duckdb.wal
 
+# Airflow local runtime files. dags/ stays tracked.
+# airflow.cfg is generated on first start and can contain the Fernet key.
+logs/
+config/airflow.cfg
+config/airflow.cfg.*
+
 # Windows and editor junk
 Thumbs.db
 Desktop.ini

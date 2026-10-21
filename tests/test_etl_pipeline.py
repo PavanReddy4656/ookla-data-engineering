@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import duckdb
+import pyarrow.parquet as pq
 import pytest
 
 
@@ -518,3 +519,210 @@ def test_zero_row_input_reports_a_zero_rejection_percentage(
     assert summary.index("Duration:") < len(summary)
     pipeline_logs = [record for record in caplog.records if record.name == "etl_pipeline"]
     assert not any(record.levelno == logging.WARNING for record in pipeline_logs)
+
+
+def parquet_fields(path: Path) -> list[tuple[str, str]]:
+    """Return column names and data types, without Parquet file metadata."""
+    schema = pq.read_schema(path)
+    return [(field.name, str(field.type)) for field in schema]
+
+
+def test_multiple_batches_keep_valid_rows_and_nulls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protect_project_data: None,
+) -> None:
+    """Rows in later batches follow the same rules as rows in the first batch."""
+    monkeypatch.setattr(etl_pipeline, "PARQUET_BATCH_ROWS", 2)
+    calls = {"batches": 0}
+    original_split = etl_pipeline.split_batch
+
+    def count_batches(connection, batch, schema):
+        calls["batches"] += 1
+        return original_split(connection, batch, schema)
+
+    monkeypatch.setattr(etl_pipeline, "split_batch", count_batches)
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    write_sample(
+        source,
+        [
+            make_row("valid-a"),
+            make_row("valid-b", avg_lat_down_ms=None),
+            make_row("rejected", avg_d_kbps=-1),
+            make_row("valid-c", avg_lat_up_ms=None),
+        ],
+    )
+
+    counts = etl_pipeline.run_pipeline(
+        source_path=source,
+        valid_output_path=valid_output,
+        rejected_output_path=rejected_output,
+    )
+
+    assert calls["batches"] == 2
+    assert counts.input_rows == 4
+    assert counts.valid_rows == 3
+    assert counts.rejected_rows == 1
+    assert counts.rejection_percentage == 25.0
+    assert counts.null_avg_lat_down_ms == 1
+    assert counts.null_avg_lat_up_ms == 1
+    assert counts.missing_either_latency_direction == 2
+    assert parquet_fields(valid_output) == parquet_fields(source)
+    assert parquet_fields(rejected_output) == parquet_fields(source)
+    valid_rows = {row["quadkey"]: row for row in read_sample(valid_output)}
+    assert set(valid_rows) == {"valid-a", "valid-b", "valid-c"}
+    assert valid_rows["valid-b"]["avg_lat_down_ms"] is None
+    assert valid_rows["valid-b"]["avg_lat_up_ms"] == 15
+    assert valid_rows["valid-c"]["avg_lat_down_ms"] == 10
+    assert valid_rows["valid-c"]["avg_lat_up_ms"] is None
+    rejected_rows = read_sample(rejected_output)
+    assert [row["quadkey"] for row in rejected_rows] == ["rejected"]
+    assert not (tmp_path / "valid.parquet.partial").exists()
+    assert not (tmp_path / "rejected.parquet.partial").exists()
+    assert not (tmp_path / etl_pipeline.DUCKDB_TEMP_DIR_NAME).exists()
+
+
+def test_failure_after_the_first_batch_keeps_existing_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protect_project_data: None,
+) -> None:
+    """A failed later batch removes partial files and does not replace outputs."""
+    monkeypatch.setattr(etl_pipeline, "PARQUET_BATCH_ROWS", 2)
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    write_sample(
+        source,
+        [
+            make_row("one"),
+            make_row("two"),
+            make_row("three"),
+            make_row("four"),
+        ],
+    )
+    original_valid = b"original-valid"
+    original_rejected = b"original-rejected"
+    valid_output.write_bytes(original_valid)
+    rejected_output.write_bytes(original_rejected)
+    calls = {"writes": 0}
+    original_append = etl_pipeline.append_table
+
+    def fail_on_second_batch(writer, path, schema, table):
+        calls["writes"] += 1
+        if calls["writes"] > 1:
+            raise RuntimeError("simulated batch failure")
+        return original_append(writer, path, schema, table)
+
+    monkeypatch.setattr(etl_pipeline, "append_table", fail_on_second_batch)
+
+    with pytest.raises(RuntimeError, match="simulated batch failure"):
+        etl_pipeline.run_pipeline(
+            source_path=source,
+            valid_output_path=valid_output,
+            rejected_output_path=rejected_output,
+        )
+
+    assert calls["writes"] == 2
+    assert valid_output.read_bytes() == original_valid
+    assert rejected_output.read_bytes() == original_rejected
+    assert not (tmp_path / "valid.parquet.partial").exists()
+    assert not (tmp_path / "rejected.parquet.partial").exists()
+    assert not (tmp_path / etl_pipeline.DUCKDB_TEMP_DIR_NAME).exists()
+
+
+def test_leftover_partial_files_are_replaced_by_a_successful_run(
+    tmp_path: Path,
+    protect_project_data: None,
+) -> None:
+    """Partial files left by a killed run are removed when a later run finishes."""
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    write_sample(source, [make_row("kept", avg_lat_down_ms=None)])
+    valid_partial = tmp_path / "valid.parquet.partial"
+    rejected_partial = tmp_path / "rejected.parquet.partial"
+    valid_partial.write_bytes(b"partial file from a killed run")
+    rejected_partial.write_bytes(b"partial file from a killed run")
+
+    counts = etl_pipeline.run_pipeline(
+        source_path=source,
+        valid_output_path=valid_output,
+        rejected_output_path=rejected_output,
+    )
+
+    assert counts.valid_rows == 1
+    assert counts.rejected_rows == 0
+    assert not valid_partial.exists()
+    assert not rejected_partial.exists()
+    written = read_sample(valid_output)
+    assert written[0]["quadkey"] == "kept"
+    assert written[0]["avg_lat_down_ms"] is None
+    assert not rejected_output.exists()
+
+
+def test_empty_input_preserves_the_source_schema(
+    tmp_path: Path,
+    protect_project_data: None,
+) -> None:
+    """An empty input still publishes a valid file with the original columns."""
+    source = tmp_path / "input.parquet"
+    valid_output = tmp_path / "valid.parquet"
+    rejected_output = tmp_path / "rejected.parquet"
+    rejected_output.write_text("stale rejected file", encoding="utf-8")
+    write_sample(source, [])
+
+    counts = etl_pipeline.run_pipeline(
+        source_path=source,
+        valid_output_path=valid_output,
+        rejected_output_path=rejected_output,
+    )
+
+    assert counts.input_rows == 0
+    assert counts.valid_rows == 0
+    assert counts.rejected_rows == 0
+    assert counts.rejection_percentage == 0.0
+    assert valid_output.is_file()
+    assert read_sample(valid_output) == []
+    assert parquet_fields(valid_output) == parquet_fields(source)
+    assert not rejected_output.exists()
+    assert not (tmp_path / "valid.parquet.partial").exists()
+
+
+def test_duckdb_uses_the_memory_limit_and_output_temp_directory(
+    tmp_path: Path,
+    protect_project_data: None,
+) -> None:
+    """The pipeline connection spills into the output folder with a fixed budget.
+
+    DuckDB stores the 512MB decimal limit and reports it as 488.2 MiB.
+    """
+    source = tmp_path / "input.parquet"
+    temp_dir = tmp_path / etl_pipeline.DUCKDB_TEMP_DIR_NAME
+    connection = duckdb.connect(database=":memory:")
+    try:
+        etl_pipeline.configure_duckdb(connection, temp_dir, tmp_path, source)
+        settings = dict(
+            connection.execute(
+                """
+                SELECT name, value
+                FROM duckdb_settings()
+                WHERE name IN (
+                    'memory_limit',
+                    'threads',
+                    'preserve_insertion_order',
+                    'temp_directory'
+                )
+                """
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+    assert settings["memory_limit"] == "488.2 MiB"
+    assert settings["threads"] == "1"
+    assert settings["preserve_insertion_order"] == "false"
+    assert Path(settings["temp_directory"]).resolve() == temp_dir.resolve()
+    assert temp_dir.is_dir()

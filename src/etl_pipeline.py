@@ -1,8 +1,9 @@
 r"""Build the processed Ookla dataset from the raw Parquet file.
 
-DuckDB reads the raw file and writes valid rows to data/processed.
-Rejected rows are written only when at least one row fails validation.
-The raw file is never modified, and pandas is not used.
+DuckDB checks the rules. PyArrow reads and writes the Parquet file in batches
+so the full dataset is not loaded at once. Rejected rows are written only when
+at least one row fails validation. The raw file is never modified, and pandas
+is not used.
 
 From the project folder in PowerShell:
 
@@ -15,9 +16,12 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import shutil
 import time
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 # INFO is normal progress. WARNING means some rows failed validation
@@ -37,6 +41,11 @@ RAW_DATASET_PATH = (
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 VALID_OUTPUT_PATH = PROCESSED_DIR / "2024-10-01_performance_fixed_tiles.parquet"
 REJECTED_OUTPUT_PATH = PROCESSED_DIR / "rejected_records.parquet"
+
+# Each write batch stays near this many rows. Tests can set a smaller number.
+# One batch of the Ookla file is far smaller than the decompressed tile column.
+PARQUET_BATCH_ROWS = 100_000
+DUCKDB_TEMP_DIR_NAME = ".duckdb-temp"
 
 # A row is valid only when every line inside this expression is true.
 # avg_lat_down_ms and avg_lat_up_ms are intentionally left out: a null in
@@ -213,53 +222,140 @@ def collect_counts(
     return counts
 
 
-def write_filtered_parquet(
+def configure_duckdb(
     connection: duckdb.DuckDBPyConnection,
-    source: Path,
-    destination: Path,
-    where_sql: str,
-    expected_rows: int,
+    temp_dir: Path,
     allowed_dir: Path,
+    source_path: Path,
 ) -> None:
-    """Write a filtered copy, then replace the previous output file.
+    """Keep DuckDB inside a fixed memory budget and spill into the output folder.
 
-    The query selects every original column, so latency nulls stay null.
-    A temporary file is published with os.replace only after its row count
-    matches the count from the validation query.
+    512MB is a decimal limit. DuckDB reports that same limit as 488.2 MiB.
+    One thread avoids decoding several Parquet row groups at the same time.
     """
-    assert_safe_output(destination, allowed_dir, source)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    partial_path = destination.with_name(destination.name + ".partial")
-    assert_safe_output(partial_path, allowed_dir, source)
-    if partial_path.exists():
-        partial_path.unlink()
+    assert_safe_output(temp_dir, allowed_dir, source_path)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    connection.execute("SET memory_limit='512MB'")
+    connection.execute("SET threads=1")
+    connection.execute("SET preserve_insertion_order=false")
+    connection.execute(f"SET temp_directory='{sql_file_path(temp_dir)}'")
 
-    copy_sql = f"""
-        COPY (
-            SELECT *
-            FROM read_parquet(?)
-            WHERE {where_sql}
-        ) TO '{sql_file_path(partial_path)}' (FORMAT PARQUET)
-    """
+
+def partial_output_path(destination: Path) -> Path:
+    """Return the temporary file published only after its row count is checked."""
+    return destination.with_name(destination.name + ".partial")
+
+
+def remove_partial_file(path: Path) -> None:
+    """Delete a leftover partial file without touching a finished output."""
+    if path.name.endswith(".partial") and path.exists():
+        path.unlink()
+
+
+def remove_directory(path: Path) -> None:
+    """Remove the DuckDB spill directory after the connection is closed."""
+    if path.name != DUCKDB_TEMP_DIR_NAME or not path.exists():
+        return
+    shutil.rmtree(path)
+
+
+def close_writer(writer: pq.ParquetWriter | None) -> None:
+    """Close a Parquet writer. A missing writer has nothing to close."""
+    if writer is not None:
+        writer.close()
+
+
+def release_quietly(close_file) -> None:
+    """Close a temporary file without hiding the error that caused the cleanup."""
     try:
-        connection.execute(copy_sql, [str(source)])
-        written_row = connection.execute(
-            "SELECT count(*) FROM read_parquet(?)",
-            [str(partial_path)],
-        ).fetchone()
-        written_rows = as_int(written_row[0] if written_row else None)
-        if written_rows != expected_rows:
-            raise RuntimeError(
-                "The output file does not contain the expected number of rows.\n"
-                f"  File: {partial_path}\n"
-                f"  Expected rows: {expected_rows:,}\n"
-                f"  Written rows: {written_rows:,}"
-            )
-        os.replace(partial_path, destination)
+        close_file()
     except Exception:
-        if partial_path.exists():
-            partial_path.unlink()
-        raise
+        logger.exception("Could not close a temporary pipeline file.")
+
+
+def align_to_source_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Put a filtered batch back on the source column names and types.
+
+    Nulls stay null. This also keeps integer widths that DuckDB may widen.
+    """
+    if table.schema.equals(schema):
+        return table
+    return table.select(schema.names).cast(schema)
+
+
+def split_batch(
+    connection: duckdb.DuckDBPyConnection,
+    batch: pa.RecordBatch,
+    schema: pa.Schema,
+) -> tuple[pa.Table, pa.Table]:
+    """Apply the validation rule to one batch and return valid and rejected rows."""
+    registered = pa.Table.from_batches([batch])
+    connection.register("input_batch", registered)
+    try:
+        valid = align_to_source_schema(
+            connection.execute(
+                f"SELECT * FROM input_batch WHERE {VALID_RECORD_CONDITION}"
+            ).to_arrow_table(),
+            schema,
+        )
+        rejected = align_to_source_schema(
+            connection.execute(
+                f"SELECT * FROM input_batch WHERE NOT {VALID_RECORD_CONDITION}"
+            ).to_arrow_table(),
+            schema,
+        )
+    finally:
+        connection.unregister("input_batch")
+    return valid, rejected
+
+
+def append_table(
+    writer: pq.ParquetWriter | None,
+    path: Path,
+    schema: pa.Schema,
+    table: pa.Table,
+) -> pq.ParquetWriter | None:
+    """Append one non-empty batch to a partial Parquet file."""
+    if table.num_rows == 0:
+        return writer
+    if writer is None:
+        writer = pq.ParquetWriter(str(path), schema)
+        try:
+            writer.write_table(table)
+        except Exception:
+            writer.close()
+            raise
+        return writer
+    writer.write_table(table)
+    return writer
+
+
+def count_parquet_rows(
+    connection: duckdb.DuckDBPyConnection,
+    path: Path,
+) -> int:
+    """Count rows in a Parquet file without loading the table into memory."""
+    row = connection.execute(
+        "SELECT count(*) FROM read_parquet(?)",
+        [str(path)],
+    ).fetchone()
+    return as_int(row[0] if row else None)
+
+
+def require_row_count(
+    connection: duckdb.DuckDBPyConnection,
+    path: Path,
+    expected_rows: int,
+) -> None:
+    """Stop before publishing when a partial file has the wrong number of rows."""
+    written_rows = count_parquet_rows(connection, path)
+    if written_rows != expected_rows:
+        raise RuntimeError(
+            "The output file does not contain the expected number of rows.\n"
+            f"  File: {path}\n"
+            f"  Expected rows: {expected_rows:,}\n"
+            f"  Written rows: {written_rows:,}"
+        )
 
 
 def remove_stale_rejected_file(
@@ -308,7 +404,11 @@ def build_outputs(
     valid_output_path: Path,
     rejected_output_path: Path,
 ) -> None:
-    """Write this run's output files. Earlier files in that folder may be replaced."""
+    """Write valid and rejected rows in batches, then publish the finished files.
+
+    Partial files are replaced onto the destinations only after both row counts
+    match. A failure deletes the partials and leaves the previous outputs in place.
+    """
     if valid_output_path.parent.resolve() != rejected_output_path.parent.resolve():
         raise RuntimeError(
             "Valid and rejected outputs must be written to the same folder.\n"
@@ -317,30 +417,67 @@ def build_outputs(
         )
 
     allowed_dir = valid_output_path.parent
+    allowed_dir.mkdir(parents=True, exist_ok=True)
+    assert_safe_output(valid_output_path, allowed_dir, source_path)
+    assert_safe_output(rejected_output_path, allowed_dir, source_path)
+    valid_partial = partial_output_path(valid_output_path)
+    rejected_partial = partial_output_path(rejected_output_path)
+    assert_safe_output(valid_partial, allowed_dir, source_path)
+    assert_safe_output(rejected_partial, allowed_dir, source_path)
+    # A killed run can leave these behind. Remove them before this run writes.
+    remove_partial_file(valid_partial)
+    remove_partial_file(rejected_partial)
+
     print("Writing valid records.", flush=True)
-    write_filtered_parquet(
-        connection,
-        source_path,
-        valid_output_path,
-        VALID_RECORD_CONDITION,
-        counts.valid_rows,
-        allowed_dir,
-    )
+    valid_writer: pq.ParquetWriter | None = None
+    rejected_writer: pq.ParquetWriter | None = None
+    source_reader = pq.ParquetFile(source_path)
+    source_reader_open = True
+    try:
+        schema = source_reader.schema_arrow
+        for batch in source_reader.iter_batches(batch_size=PARQUET_BATCH_ROWS):
+            if batch.num_rows == 0:
+                continue
+            valid_table, rejected_table = split_batch(connection, batch, schema)
+            if valid_table.num_rows:
+                valid_writer = append_table(
+                    valid_writer, valid_partial, schema, valid_table
+                )
+            if rejected_table.num_rows:
+                rejected_writer = append_table(
+                    rejected_writer, rejected_partial, schema, rejected_table
+                )
+        if valid_writer is None:
+            valid_writer = pq.ParquetWriter(str(valid_partial), schema)
+        close_writer(valid_writer)
+        valid_writer = None
+        close_writer(rejected_writer)
+        rejected_writer = None
+        source_reader.close()
+        source_reader_open = False
 
-    if counts.rejected_rows > 0:
-        print("Writing rejected records.", flush=True)
-        write_filtered_parquet(
-            connection,
-            source_path,
-            rejected_output_path,
-            f"NOT {VALID_RECORD_CONDITION}",
-            counts.rejected_rows,
-            allowed_dir,
-        )
-        return
+        require_row_count(connection, valid_partial, counts.valid_rows)
+        if counts.rejected_rows > 0:
+            require_row_count(connection, rejected_partial, counts.rejected_rows)
+        elif rejected_partial.exists():
+            require_row_count(connection, rejected_partial, 0)
 
-    print("No records failed validation.", flush=True)
-    remove_stale_rejected_file(rejected_output_path, allowed_dir, source_path)
+        os.replace(valid_partial, valid_output_path)
+        if counts.rejected_rows > 0:
+            print("Writing rejected records.", flush=True)
+            os.replace(rejected_partial, rejected_output_path)
+            return
+
+        print("No records failed validation.", flush=True)
+        remove_stale_rejected_file(rejected_output_path, allowed_dir, source_path)
+    except Exception:
+        release_quietly(lambda: close_writer(valid_writer))
+        release_quietly(lambda: close_writer(rejected_writer))
+        if source_reader_open:
+            release_quietly(source_reader.close)
+        remove_partial_file(valid_partial)
+        remove_partial_file(rejected_partial)
+        raise
 
 
 def run_pipeline(
@@ -372,7 +509,9 @@ def run_pipeline(
         print("Counting rows with a read-only DuckDB query.", flush=True)
 
         connection = duckdb.connect(database=":memory:")
+        temp_dir = valid_output.parent / DUCKDB_TEMP_DIR_NAME
         try:
+            configure_duckdb(connection, temp_dir, valid_output.parent, source)
             counts = collect_counts(connection, source)
             logger.info("Rows read: %s", f"{counts.input_rows:,}")
             build_outputs(connection, counts, source, valid_output, rejected_output)
@@ -384,6 +523,7 @@ def run_pipeline(
             ) from error
         finally:
             connection.close()
+            remove_directory(temp_dir)
 
         current_signature = (source.stat().st_size, source.stat().st_mtime_ns)
         if current_signature != raw_signature:

@@ -1,0 +1,20 @@
+# Keep the image build from sending the dataset, secrets, or the Windows
+# virtual environment to Docker. The container reads these through mounts.
+.venv
+venv
+env
+ENV
+.git
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+data
+logs
+config
+.env
+.env.*
+*.parquet
+*.duckdb
+*.duckdb.wal
